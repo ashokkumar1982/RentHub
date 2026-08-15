@@ -196,11 +196,12 @@ onMounted(async () => {
               min="0"
               step="0.01"
               class="input"
-              :readonly="previousReadingKnown"
-              :class="previousReadingKnown ? 'bg-slate-50 text-slate-500' : ''"
             />
             <p v-if="!previousReadingKnown" class="text-xs text-amber-600 mt-1">
               No prior reading found — enter the starting meter value.
+            </p>
+            <p v-else-if="existingForRoom" class="text-xs text-slate-500 mt-1">
+              Auto-filled from the saved reading — edit and save to correct it.
             </p>
           </div>
           <div>

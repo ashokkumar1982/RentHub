@@ -19,6 +19,10 @@ const formError = ref('')
 const idFile = ref<File | null>(null)
 const rentTouchedManually = ref(false)
 
+const deleting = ref<Tenant | null>(null)
+const deleteError = ref('')
+const deleteBusy = ref(false)
+
 const emptyForm = () => ({
   full_name: '',
   mobile: '',
@@ -184,6 +188,41 @@ async function handleSave() {
   await loadData()
 }
 
+function openDelete(tenant: Tenant) {
+  deleteError.value = ''
+  deleting.value = tenant
+}
+
+async function handleDelete() {
+  if (!deleting.value) return
+  deleteBusy.value = true
+  deleteError.value = ''
+
+  const tenant = deleting.value
+  const { error: err } = await supabase.from('tenants').delete().eq('id', tenant.id)
+
+  if (err) {
+    deleteBusy.value = false
+    // Bills/payments reference this tenant and block deletion — guide the user instead of failing silently.
+    if (err.message.toLowerCase().includes('foreign key') || err.code === '23503') {
+      deleteError.value =
+        'This tenant has bills or payments on record, so they can\'t be permanently deleted. Mark them as "Vacated" instead to keep billing history intact.'
+    } else {
+      deleteError.value = err.message
+    }
+    return
+  }
+
+  // Free up the room the tenant was occupying, if any.
+  if (tenant.room_id) {
+    await supabase.from('rooms').update({ status: 'vacant' }).eq('id', tenant.room_id)
+  }
+
+  deleteBusy.value = false
+  deleting.value = null
+  await loadData()
+}
+
 onMounted(loadData)
 </script>
 
@@ -225,6 +264,7 @@ onMounted(loadData)
             <td class="text-right space-x-2 whitespace-nowrap">
               <button class="text-brand-600 hover:underline text-xs" @click="viewing = tenant">View</button>
               <button class="text-brand-600 hover:underline text-xs" @click="openEdit(tenant)">Edit</button>
+              <button class="text-red-600 hover:underline text-xs" @click="openDelete(tenant)">Delete</button>
             </td>
           </tr>
           <tr v-if="tenants.length === 0">
@@ -351,6 +391,20 @@ onMounted(loadData)
         <div class="flex justify-between"><dt class="text-slate-500">Status</dt><dd>{{ viewing.status }}</dd></div>
         <div class="flex justify-between"><dt class="text-slate-500">Notes</dt><dd class="text-right">{{ viewing.notes || '-' }}</dd></div>
       </dl>
+    </Modal>
+
+    <Modal v-if="deleting" title="Delete Tenant" @close="deleting = null">
+      <p class="text-sm text-slate-700">
+        Are you sure you want to permanently delete <span class="font-medium">{{ deleting.full_name }}</span>?
+        This action cannot be undone.
+      </p>
+      <p v-if="deleteError" class="text-sm text-red-600 mt-3">{{ deleteError }}</p>
+      <div class="flex justify-end gap-2 pt-4">
+        <button type="button" class="btn-secondary" :disabled="deleteBusy" @click="deleting = null">Cancel</button>
+        <button type="button" class="btn-danger" :disabled="deleteBusy" @click="handleDelete">
+          {{ deleteBusy ? 'Deleting…' : 'Delete Permanently' }}
+        </button>
+      </div>
     </Modal>
   </div>
 </template>
