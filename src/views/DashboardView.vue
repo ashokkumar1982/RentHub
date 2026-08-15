@@ -80,6 +80,18 @@ const periodOutstanding = computed(() =>
 )
 const periodPaymentsFiltered = computed(() => paymentsThisPeriod.value.filter((p) => roomMatchesFilter(p.room_id)))
 const periodReceived = computed(() => periodPaymentsFiltered.value.reduce((sum, p) => sum + Number(p.amount), 0))
+// Split by which bill each payment actually cleared — a payment can land in this calendar
+// month (by payment_date) but pay off a bill from an earlier billing_month (an old due).
+const receivedForThisMonthsBills = computed(() =>
+  periodPaymentsFiltered.value
+    .filter((p) => p.bill?.billing_month === selectedBillingMonth.value)
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+)
+const receivedForOtherDues = computed(() =>
+  periodPaymentsFiltered.value
+    .filter((p) => p.bill?.billing_month !== selectedBillingMonth.value)
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+)
 const collectionRatePct = computed(() =>
   periodBilled.value > 0 ? Math.round((periodReceived.value / periodBilled.value) * 100) : null
 )
@@ -182,7 +194,7 @@ async function loadBillsForSelectedMonth() {
 async function loadPaymentsForSelectedMonth() {
   const { data } = await supabase
     .from('payments')
-    .select('*, tenant:tenants(*), room:rooms(*)')
+    .select('*, tenant:tenants(*), room:rooms(*), bill:bills(billing_month, bill_number)')
     .gte('payment_date', periodStart.value)
     .lte('payment_date', periodEnd.value)
     .order('payment_date', { ascending: false })
@@ -288,7 +300,12 @@ const quickActions = [
           <div class="card">
             <p class="text-xs text-slate-500">Amount Received</p>
             <p class="text-2xl font-semibold mt-1 text-green-600">{{ formatCurrency(periodReceived) }}</p>
-            <p class="text-[11px] text-slate-400 mt-0.5">By payment date, incl. dues from other months</p>
+            <p class="text-[11px] text-slate-400 mt-1 leading-snug">
+              {{ formatCurrency(receivedForThisMonthsBills) }} for this month's bills
+              <template v-if="receivedForOtherDues > 0">
+                <br />+ {{ formatCurrency(receivedForOtherDues) }} clearing dues from other months
+              </template>
+            </p>
           </div>
           <div class="card">
             <p class="text-xs text-slate-500">Outstanding (this period)</p>
@@ -379,13 +396,21 @@ const quickActions = [
         </div>
         <table v-if="periodPaymentsFiltered.length" class="table-base">
           <thead>
-            <tr><th>Date</th><th>Tenant</th><th>Room</th><th>Amount</th><th>Method</th><th>Reference</th></tr>
+            <tr><th>Date</th><th>Tenant</th><th>Room</th><th>Bill Month</th><th>Amount</th><th>Method</th><th>Reference</th></tr>
           </thead>
           <tbody>
             <tr v-for="p in periodPaymentsFiltered" :key="p.id">
               <td>{{ formatDate(p.payment_date) }}</td>
               <td>{{ p.tenant?.full_name || '-' }}</td>
               <td>{{ p.room?.room_number || '-' }}</td>
+              <td>
+                <span
+                  class="badge"
+                  :class="p.bill?.billing_month === selectedBillingMonth ? 'bg-slate-100 text-slate-600' : 'bg-amber-100 text-amber-700'"
+                >
+                  {{ p.bill?.billing_month ? formatMonth(p.bill.billing_month) : '-' }}
+                </span>
+              </td>
               <td class="font-medium">{{ formatCurrency(p.amount) }}</td>
               <td class="capitalize">{{ p.payment_method.replace('_', ' ') }}</td>
               <td>{{ p.reference_number || '-' }}</td>
