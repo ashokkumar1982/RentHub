@@ -184,8 +184,9 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
                   'bg-amber-100 text-amber-700': row.bill.finalized && row.bill.payment_status === 'partially_paid',
                   'bg-red-100 text-red-700': row.bill.finalized && row.bill.payment_status === 'unpaid',
                 }"
+                :title="row.bill.settled_via_later_bill ? `Settled automatically via a later month's payment` : ''"
               >
-                {{ row.bill.finalized ? row.bill.payment_status.replace('_', ' ') : 'draft' }}
+                {{ row.bill.finalized ? row.bill.payment_status.replace('_', ' ') : 'draft' }}{{ row.bill.settled_via_later_bill ? ' *' : '' }}
               </span>
               <span v-else class="badge bg-slate-100 text-slate-400">no bill</span>
             </td>

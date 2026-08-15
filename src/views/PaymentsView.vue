@@ -3,10 +3,14 @@ import { ref, onMounted, reactive, computed } from 'vue'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatDate, formatMonth } from '../lib/format'
 import { recordPayment } from '../lib/payments'
+import { latestBillPerTenant } from '../lib/billing'
 import type { Payment, Bill, PaymentMethod } from '../types/models'
 import Modal from '../components/Modal.vue'
 
 const payments = ref<Payment[]>([])
+// Bill totals are cumulative, so only each tenant's most recent bill reflects
+// what's actually still owed — see latestBillPerTenant. This list drives both
+// the single "Record Payment" dropdown and the "Collect Payment" tenant picker.
 const outstandingBills = ref<Bill[]>([])
 const loading = ref(true)
 
@@ -23,11 +27,12 @@ const form = reactive({
 const formError = ref('')
 const saving = ref(false)
 
-// ---- Collect Payment (multiple months at once) ----
+// ---- Collect Payment (settle a tenant's full cumulative balance) ----
 const showCollectModal = ref(false)
 const collectTenantId = ref('')
-const collectRows = ref<{ bill: Bill; amount: number }[]>([])
-const collectTotalInput = ref(0)
+const collectBill = ref<Bill | null>(null) // the tenant's one true payable (latest) bill
+const collectChainBills = ref<Bill[]>([]) // earlier bills already folded into it, for preview
+const collectAmount = ref(0)
 const collectForm = reactive({
   payment_date: new Date().toISOString().slice(0, 10),
   payment_method: 'cash' as PaymentMethod,
@@ -36,33 +41,18 @@ const collectForm = reactive({
 })
 const collectError = ref('')
 const collectSaving = ref(false)
+const collectLoadingChain = ref(false)
 
-const tenantsWithOutstanding = computed(() => {
-  const map = new Map<string, { tenant_id: string; name: string; room: string; total: number; count: number }>()
-  for (const b of outstandingBills.value) {
-    const key = b.tenant_id
-    const existing = map.get(key)
-    if (existing) {
-      existing.total += Number(b.outstanding_amount)
-      existing.count += 1
-    } else {
-      map.set(key, {
-        tenant_id: key,
-        name: b.tenant?.full_name || 'Unknown tenant',
-        room: b.room?.room_number || '-',
-        total: Number(b.outstanding_amount),
-        count: 1,
-      })
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name))
-})
-
-const collectTotalAllocated = computed(() =>
-  collectRows.value.reduce((sum, r) => sum + (Number(r.amount) || 0), 0)
-)
-const collectTotalOutstanding = computed(() =>
-  collectRows.value.reduce((sum, r) => sum + Number(r.bill.outstanding_amount), 0)
+const tenantsWithOutstanding = computed(() =>
+  [...outstandingBills.value]
+    .map((b) => ({
+      tenant_id: b.tenant_id,
+      name: b.tenant?.full_name || 'Unknown tenant',
+      room: b.room?.room_number || '-',
+      total: Number(b.outstanding_amount),
+      billing_month: b.billing_month,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
 )
 
 async function loadPayments() {
@@ -80,7 +70,7 @@ async function loadOutstandingBills() {
     .gt('outstanding_amount', 0)
     .eq('finalized', true)
     .order('billing_month', { ascending: false })
-  outstandingBills.value = data ?? []
+  outstandingBills.value = latestBillPerTenant(data ?? [])
 }
 
 async function loadAll() {
@@ -144,8 +134,9 @@ function exportCsv() {
 
 function openCollectModal() {
   collectTenantId.value = ''
-  collectRows.value = []
-  collectTotalInput.value = 0
+  collectBill.value = null
+  collectChainBills.value = []
+  collectAmount.value = 0
   collectForm.payment_date = new Date().toISOString().slice(0, 10)
   collectForm.payment_method = 'cash'
   collectForm.reference_number = ''
@@ -154,72 +145,63 @@ function openCollectModal() {
   showCollectModal.value = true
 }
 
-function onCollectTenantChange() {
-  const bills = outstandingBills.value
-    .filter((b) => b.tenant_id === collectTenantId.value)
-    .sort((a, b) => a.billing_month.localeCompare(b.billing_month)) // oldest first
-  collectRows.value = bills.map((bill) => ({ bill, amount: 0 }))
-  collectTotalInput.value = 0
+async function onCollectTenantChange() {
   collectError.value = ''
-}
+  collectBill.value = outstandingBills.value.find((b) => b.tenant_id === collectTenantId.value) || null
+  collectAmount.value = collectBill.value?.outstanding_amount ?? 0
+  collectChainBills.value = []
+  if (!collectBill.value) return
 
-// Fills each unpaid bill's amount oldest-first, up to what it owes, until the entered total runs out.
-// Rows stay individually editable afterward for manual adjustment.
-function distributeOldestFirst() {
-  let remaining = Math.round((Number(collectTotalInput.value) || 0) * 100) / 100
-  for (const row of collectRows.value) {
-    const owed = Number(row.bill.outstanding_amount)
-    const alloc = Math.max(0, Math.min(owed, remaining))
-    row.amount = Math.round(alloc * 100) / 100
-    remaining = Math.round((remaining - alloc) * 100) / 100
-  }
+  // Preview which earlier months are already folded into this balance and will
+  // flip to "Paid" once this bill is settled in full.
+  collectLoadingChain.value = true
+  const { data } = await supabase
+    .from('bills')
+    .select('*')
+    .eq('tenant_id', collectBill.value.tenant_id)
+    .lt('billing_month', collectBill.value.billing_month)
+    .neq('payment_status', 'paid')
+    .order('billing_month', { ascending: true })
+  collectChainBills.value = data ?? []
+  collectLoadingChain.value = false
 }
 
 async function submitCollectPayment() {
   collectError.value = ''
-  const rowsToApply = collectRows.value.filter((r) => Number(r.amount) > 0)
-  if (rowsToApply.length === 0) {
-    collectError.value = 'Enter an amount against at least one month.'
+  if (!collectBill.value) {
+    collectError.value = 'Select a tenant.'
     return
   }
-  for (const row of rowsToApply) {
-    if (Number(row.amount) > Number(row.bill.outstanding_amount) + 0.01) {
-      collectError.value = `Amount for ${formatMonth(row.bill.billing_month)} exceeds its outstanding balance of ${formatCurrency(row.bill.outstanding_amount)}.`
-      return
-    }
+  if (!collectAmount.value || collectAmount.value <= 0) {
+    collectError.value = 'Enter an amount greater than zero.'
+    return
   }
-
   collectSaving.value = true
-  for (const row of rowsToApply) {
-    const { error } = await recordPayment(row.bill, {
-      amount: Number(row.amount),
-      payment_date: collectForm.payment_date,
-      payment_method: collectForm.payment_method,
-      reference_number: collectForm.reference_number,
-      notes: collectForm.notes,
-    })
-    if (error) {
-      collectError.value = `${formatMonth(row.bill.billing_month)}: ${error}`
-      collectSaving.value = false
-      await loadAll() // reflect whatever succeeded before the failure
-      return
-    }
-  }
+  const { error } = await recordPayment(collectBill.value, {
+    amount: collectAmount.value,
+    payment_date: collectForm.payment_date,
+    payment_method: collectForm.payment_method,
+    reference_number: collectForm.reference_number,
+    notes: collectForm.notes,
+  })
   collectSaving.value = false
+  if (error) {
+    collectError.value = error
+    return
+  }
   showCollectModal.value = false
   await loadAll()
 }
 
 onMounted(loadAll)
 </script>
-
 <template>
   <div class="space-y-4">
     <div class="flex items-center justify-between flex-wrap gap-2">
       <h1 class="text-lg font-semibold text-slate-800">Payments</h1>
       <div class="flex gap-2">
         <button class="btn-secondary" @click="exportCsv">Export CSV</button>
-        <button class="btn-secondary" @click="openCollectModal">Collect Payment (multi-month)</button>
+        <button class="btn-secondary" @click="openCollectModal">Collect Payment (settle balance)</button>
         <button class="btn-primary" @click="openModal">+ Record Payment</button>
       </div>
     </div>
@@ -295,48 +277,38 @@ onMounted(loadAll)
       </form>
     </Modal>
 
-    <Modal v-if="showCollectModal" title="Collect Payment (Multiple Months)" @close="showCollectModal = false">
+    <Modal v-if="showCollectModal" title="Collect Payment" @close="showCollectModal = false">
       <form class="space-y-3" @submit.prevent="submitCollectPayment">
         <div>
           <label class="label">Tenant</label>
           <select v-model="collectTenantId" class="input" @change="onCollectTenantChange">
-            <option value="">-- Select a tenant with unpaid bills --</option>
+            <option value="">-- Select a tenant with an outstanding balance --</option>
             <option v-for="t in tenantsWithOutstanding" :key="t.tenant_id" :value="t.tenant_id">
-              {{ t.name }} — Room {{ t.room }} — {{ t.count }} month(s) owed — {{ formatCurrency(t.total) }}
+              {{ t.name }} — Room {{ t.room }} — {{ formatCurrency(t.total) }} (as of {{ formatMonth(t.billing_month) }})
             </option>
           </select>
         </div>
 
-        <template v-if="collectRows.length > 0">
-          <div class="flex items-end gap-2">
-            <div class="flex-1">
-              <label class="label">Total Amount Received (₹)</label>
-              <input v-model.number="collectTotalInput" type="number" min="0" step="0.01" class="input" />
-            </div>
-            <button type="button" class="btn-secondary whitespace-nowrap" @click="distributeOldestFirst">
-              Auto-fill oldest first
-            </button>
-          </div>
-
-          <div class="border border-slate-200 rounded-md divide-y divide-slate-100">
-            <div v-for="row in collectRows" :key="row.bill.id" class="flex items-center justify-between gap-3 px-3 py-2">
-              <div class="text-sm">
-                <p class="font-medium text-slate-700">{{ formatMonth(row.bill.billing_month) }}</p>
-                <p class="text-xs text-slate-400">Outstanding {{ formatCurrency(row.bill.outstanding_amount) }}</p>
-              </div>
-              <input
-                v-model.number="row.amount"
-                type="number"
-                min="0"
-                step="0.01"
-                class="input w-32 text-right"
-              />
-            </div>
-          </div>
-
+        <template v-if="collectBill">
           <div class="flex justify-between text-sm bg-slate-50 rounded-md px-3 py-2">
-            <span class="text-slate-500">Allocated / Total Owed</span>
-            <span class="font-medium">{{ formatCurrency(collectTotalAllocated) }} / {{ formatCurrency(collectTotalOutstanding) }}</span>
+            <span class="text-slate-500">Total Outstanding</span>
+            <span class="font-medium">{{ formatCurrency(collectBill.outstanding_amount) }}</span>
+          </div>
+
+          <p v-if="collectLoadingChain" class="text-xs text-slate-400">Checking earlier months…</p>
+          <div v-else-if="collectChainBills.length > 0" class="text-xs text-slate-500 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
+            This balance already includes carried-forward dues from
+            <span class="font-medium">{{ collectChainBills.map(b => formatMonth(b.billing_month)).join(', ') }}</span>.
+            Paying it in full will mark those months — and {{ formatMonth(collectBill.billing_month) }} — all as
+            <span class="font-medium">Paid</span>.
+          </div>
+
+          <div>
+            <label class="label">Amount Received (₹)</label>
+            <input v-model.number="collectAmount" type="number" min="0.01" step="0.01" class="input" />
+            <p class="text-xs text-slate-400 mt-1">
+              Defaults to the full balance. A smaller amount will be applied but won't clear earlier months yet.
+            </p>
           </div>
 
           <div>
@@ -365,8 +337,8 @@ onMounted(loadAll)
         <p v-if="collectError" class="text-sm text-red-600">{{ collectError }}</p>
         <div class="flex justify-end gap-2 pt-2">
           <button type="button" class="btn-secondary" @click="showCollectModal = false">Cancel</button>
-          <button type="submit" class="btn-primary" :disabled="collectSaving || collectRows.length === 0">
-            {{ collectSaving ? 'Saving…' : 'Save Payment(s)' }}
+          <button type="submit" class="btn-primary" :disabled="collectSaving || !collectBill">
+            {{ collectSaving ? 'Saving…' : 'Save Payment' }}
           </button>
         </div>
       </form>

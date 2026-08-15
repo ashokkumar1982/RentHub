@@ -3,6 +3,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatDate, formatMonth } from '../lib/format'
+import { latestBillPerTenant } from '../lib/billing'
 import type { Room, Tenant, Bill, Payment, Property } from '../types/models'
 
 const router = useRouter()
@@ -157,8 +158,13 @@ async function loadStaticData() {
 }
 
 async function loadAllTimeOutstanding() {
-  const { data } = await supabase.from('bills').select('room_id, outstanding_amount').gt('outstanding_amount', 0)
-  allOutstandingBills.value = (data ?? []) as Bill[]
+  // Bill totals are cumulative (see latestBillPerTenant) — only each tenant's
+  // most recent bill reflects their real outstanding balance.
+  const { data } = await supabase
+    .from('bills')
+    .select('room_id, tenant_id, billing_month, outstanding_amount')
+    .gt('outstanding_amount', 0)
+  allOutstandingBills.value = latestBillPerTenant((data ?? []) as Bill[])
 }
 
 async function loadOverdueBills() {
@@ -170,7 +176,7 @@ async function loadOverdueBills() {
     .gt('outstanding_amount', 0)
     .lt('due_date', today)
     .order('due_date', { ascending: true })
-  overdueBills.value = (data ?? []) as Bill[]
+  overdueBills.value = latestBillPerTenant((data ?? []) as Bill[])
 }
 
 async function loadAvailableYears() {

@@ -286,6 +286,9 @@ async function submitPayment() {
         <div class="flex justify-between font-semibold text-base"><span>Total</span><span>{{ formatCurrency(bill.total_amount) }}</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Paid</span><span>{{ formatCurrency(bill.paid_amount) }}</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Outstanding</span><span>{{ formatCurrency(bill.outstanding_amount) }}</span></div>
+        <p v-if="bill.settled_via_later_bill" class="text-xs text-slate-400 pt-1">
+          Settled automatically — this balance was carried forward and paid off as part of a later month's bill.
+        </p>
       </div>
 
       <!-- Actions -->

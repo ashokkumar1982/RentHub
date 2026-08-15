@@ -96,6 +96,10 @@ create table if not exists bills (
   paid_amount numeric(10,2) not null default 0,
   outstanding_amount numeric(10,2) not null default 0,
   payment_status text not null default 'unpaid' check (payment_status in ('unpaid','partially_paid','paid')),
+  -- true when this bill was auto-marked paid because a later bill's cumulative
+  -- total (which already folded this bill's balance in via previous_due) was
+  -- paid off, rather than because a payment was recorded against it directly.
+  settled_via_later_bill boolean not null default false,
   whatsapp_shared boolean not null default false,
   due_date date,
   finalized boolean not null default false,

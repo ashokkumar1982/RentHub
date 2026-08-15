@@ -89,6 +89,9 @@ export interface Bill {
   paid_amount: number
   outstanding_amount: number
   payment_status: PaymentStatus
+  // true when this bill was auto-settled because a later, cumulative bill for
+  // the same tenant was paid off (see settleEarlierBills in lib/payments.ts)
+  settled_via_later_bill: boolean
   whatsapp_shared: boolean
   due_date: string | null
   finalized: boolean
