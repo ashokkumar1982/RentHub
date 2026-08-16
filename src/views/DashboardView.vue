@@ -3,7 +3,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatDate, formatMonth } from '../lib/format'
-import { latestBillPerTenant } from '../lib/billing'
+import { latestBillPerTenant, allocatedForMonth } from '../lib/billing'
 import type { Room, Tenant, Bill, Payment, Property } from '../types/models'
 
 const router = useRouter()
@@ -81,18 +81,20 @@ const periodOutstanding = computed(() =>
 )
 const periodPaymentsFiltered = computed(() => paymentsThisPeriod.value.filter((p) => roomMatchesFilter(p.room_id)))
 const periodReceived = computed(() => periodPaymentsFiltered.value.reduce((sum, p) => sum + Number(p.amount), 0))
-// Split by which bill each payment actually cleared — a payment can land in this calendar
-// month (by payment_date) but pay off a bill from an earlier billing_month (an old due).
-const receivedForThisMonthsBills = computed(() =>
-  periodPaymentsFiltered.value
-    .filter((p) => p.bill?.billing_month === selectedBillingMonth.value)
-    .reduce((sum, p) => sum + Number(p.amount), 0)
-)
-const receivedForOtherDues = computed(() =>
-  periodPaymentsFiltered.value
-    .filter((p) => p.bill?.billing_month !== selectedBillingMonth.value)
-    .reduce((sum, p) => sum + Number(p.amount), 0)
-)
+// Which month(s) this period's payments actually paid off — computed properly
+// via the ledger (oldest-first allocation), not by which bill a payment happens
+// to be tagged to (a payment is always anchored to the tenant's *latest* bill
+// for reference, regardless of which older month's balance it actually clears).
+const periodAttribution = ref<{ billing_month: string; amount: number }[]>([])
+const receivedBreakdown = computed(() => {
+  const totals = new Map<string, number>()
+  for (const row of periodAttribution.value) {
+    totals.set(row.billing_month, (totals.get(row.billing_month) ?? 0) + row.amount)
+  }
+  return Array.from(totals.entries())
+    .map(([billing_month, amount]) => ({ billing_month, amount, isCurrentMonth: billing_month === selectedBillingMonth.value }))
+    .sort((a, b) => (a.isCurrentMonth === b.isCurrentMonth ? 0 : a.isCurrentMonth ? -1 : 1))
+})
 const collectionRatePct = computed(() =>
   periodBilled.value > 0 ? Math.round((periodReceived.value / periodBilled.value) * 100) : null
 )
@@ -200,11 +202,52 @@ async function loadBillsForSelectedMonth() {
 async function loadPaymentsForSelectedMonth() {
   const { data } = await supabase
     .from('payments')
-    .select('*, tenant:tenants(*), room:rooms(*), bill:bills(billing_month, bill_number)')
+    .select('*, tenant:tenants(*), room:rooms(*)')
     .gte('payment_date', periodStart.value)
     .lte('payment_date', periodEnd.value)
     .order('payment_date', { ascending: false })
   paymentsThisPeriod.value = (data ?? []) as Payment[]
+  await loadPeriodAttribution()
+}
+
+// For every tenant who paid something in this period, walk their full bill +
+// payment history (oldest-first) and work out which month(s)' own charges got
+// newly covered between "just before this period" and "through the end of this
+// period" — the correct way to say which months a period's payments cleared.
+async function loadPeriodAttribution() {
+  const tenantIds = Array.from(new Set(periodPaymentsFiltered.value.map((p) => p.tenant_id)))
+  if (tenantIds.length === 0) {
+    periodAttribution.value = []
+    return
+  }
+
+  const [{ data: allBills }, { data: allPayments }] = await Promise.all([
+    supabase.from('bills').select('tenant_id, billing_month, total_amount').in('tenant_id', tenantIds).eq('finalized', true),
+    supabase.from('payments').select('tenant_id, payment_date, amount').in('tenant_id', tenantIds),
+  ])
+
+  const rows: { billing_month: string; amount: number }[] = []
+
+  for (const tenantId of tenantIds) {
+    const bills = (allBills ?? [])
+      .filter((b) => b.tenant_id === tenantId)
+      .sort((a, b) => a.billing_month.localeCompare(b.billing_month))
+    const pays = (allPayments ?? []).filter((p) => p.tenant_id === tenantId)
+    const receivedBefore = pays.filter((p) => p.payment_date < periodStart.value).reduce((s, p) => s + Number(p.amount), 0)
+    const receivedThrough = pays.filter((p) => p.payment_date <= periodEnd.value).reduce((s, p) => s + Number(p.amount), 0)
+
+    let cumulativeBilledBefore = 0
+    for (const b of bills) {
+      const ownCharge = Number(b.total_amount)
+      const allocatedBefore = allocatedForMonth(cumulativeBilledBefore, ownCharge, receivedBefore)
+      const allocatedThrough = allocatedForMonth(cumulativeBilledBefore, ownCharge, receivedThrough)
+      const delta = Math.round((allocatedThrough - allocatedBefore) * 100) / 100
+      if (delta > 0) rows.push({ billing_month: b.billing_month, amount: delta })
+      cumulativeBilledBefore = Math.round((cumulativeBilledBefore + ownCharge) * 100) / 100
+    }
+  }
+
+  periodAttribution.value = rows
 }
 
 async function loadYearTrend() {
@@ -222,6 +265,7 @@ watch(selectedBillingMonth, async () => {
   await Promise.all([loadBillsForSelectedMonth(), loadPaymentsForSelectedMonth()])
 })
 watch(selectedYear, loadYearTrend)
+watch(filterPropertyId, loadPeriodAttribution)
 
 onMounted(async () => {
   loading.value = true
@@ -307,10 +351,10 @@ const quickActions = [
             <p class="text-xs text-slate-500">Amount Received</p>
             <p class="text-2xl font-semibold mt-1 text-green-600">{{ formatCurrency(periodReceived) }}</p>
             <p class="text-[11px] text-slate-400 mt-1 leading-snug">
-              {{ formatCurrency(receivedForThisMonthsBills) }} for this month's bills
-              <template v-if="receivedForOtherDues > 0">
-                <br />+ {{ formatCurrency(receivedForOtherDues) }} clearing dues from other months
+              <template v-for="(r, i) in receivedBreakdown" :key="r.billing_month">
+                {{ formatCurrency(r.amount) }} {{ r.isCurrentMonth ? "for this month's bill" : `clearing dues from ${formatMonth(r.billing_month)}` }}<template v-if="i < receivedBreakdown.length - 1"><br />+ </template>
               </template>
+              <span v-if="receivedBreakdown.length === 0">—</span>
             </p>
           </div>
           <div class="card">
@@ -402,21 +446,13 @@ const quickActions = [
         </div>
         <table v-if="periodPaymentsFiltered.length" class="table-base">
           <thead>
-            <tr><th>Date</th><th>Tenant</th><th>Room</th><th>Bill Month</th><th>Amount</th><th>Method</th><th>Reference</th></tr>
+            <tr><th>Date</th><th>Tenant</th><th>Room</th><th>Amount</th><th>Method</th><th>Reference</th></tr>
           </thead>
           <tbody>
             <tr v-for="p in periodPaymentsFiltered" :key="p.id">
               <td>{{ formatDate(p.payment_date) }}</td>
               <td>{{ p.tenant?.full_name || '-' }}</td>
               <td>{{ p.room?.room_number || '-' }}</td>
-              <td>
-                <span
-                  class="badge"
-                  :class="p.bill?.billing_month === selectedBillingMonth ? 'bg-slate-100 text-slate-600' : 'bg-amber-100 text-amber-700'"
-                >
-                  {{ p.bill?.billing_month ? formatMonth(p.bill.billing_month) : '-' }}
-                </span>
-              </td>
               <td class="font-medium">{{ formatCurrency(p.amount) }}</td>
               <td class="capitalize">{{ p.payment_method.replace('_', ' ') }}</td>
               <td>{{ p.reference_number || '-' }}</td>

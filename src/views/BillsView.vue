@@ -3,7 +3,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatMonth, currentBillingMonth, recentBillingMonths } from '../lib/format'
-import { computeBillTotal, computePaymentStatus, computeOutstanding, generateBillNumber } from '../lib/billing'
+import { computeBillTotal, generateBillNumber } from '../lib/billing'
 import type { Room, Tenant, MeterReading, Bill, Property } from '../types/models'
 
 const router = useRouter()
@@ -57,23 +57,11 @@ async function loadAll() {
 watch(selectedMonth, loadAll)
 onMounted(loadAll)
 
-async function findPreviousDue(tenantId: string): Promise<number> {
-  const { data } = await supabase
-    .from('bills')
-    .select('outstanding_amount')
-    .eq('tenant_id', tenantId)
-    .lt('billing_month', selectedMonth.value)
-    .order('billing_month', { ascending: false })
-    .limit(1)
-  return data && data.length > 0 ? Number(data[0].outstanding_amount) : 0
-}
-
 async function handleGenerate(row: (typeof rows.value)[number]) {
   if (!row.tenant) return
   generating.value = row.room.id
   try {
     const property = propertyOf(row.room.property_id)
-    const previousDue = await findPreviousDue(row.tenant.id)
     const electricityAmount = row.reading?.amount ?? 0
     const rent = row.tenant.agreed_monthly_rent
     const water = row.room.water_charge
@@ -84,7 +72,6 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
       water_charge: water,
       maintenance_charge: maintenance,
       other_charge: 0,
-      previous_due: previousDue,
       discount: 0,
     })
     const prefix = property?.bill_prefix ?? 'RENT'
@@ -107,12 +94,12 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
       water_charge: water,
       maintenance_charge: maintenance,
       other_charge: 0,
-      previous_due: previousDue,
+      previous_due: 0, // populated correctly by reconcileTenantBills below
       discount: 0,
       total_amount: total,
       paid_amount: 0,
-      outstanding_amount: computeOutstanding(total, 0),
-      payment_status: computePaymentStatus(total, 0),
+      outstanding_amount: total,
+      payment_status: 'unpaid' as const,
       whatsapp_shared: false,
       due_date: dueDate,
       finalized: false,
@@ -158,7 +145,9 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
             <th>Water</th>
             <th>Maintenance</th>
             <th>Previous Due</th>
-            <th>Total</th>
+            <th>Bill Amount</th>
+            <th>Paid</th>
+            <th>Outstanding</th>
             <th>Status</th>
             <th></th>
           </tr>
@@ -174,6 +163,8 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
             <td>{{ formatCurrency(row.bill?.maintenance_charge ?? row.room.maintenance_charge) }}</td>
             <td>{{ formatCurrency(row.bill?.previous_due ?? 0) }}</td>
             <td class="font-medium">{{ row.bill ? formatCurrency(row.bill.total_amount) : '-' }}</td>
+            <td>{{ row.bill ? formatCurrency(row.bill.paid_amount) : '-' }}</td>
+            <td class="font-medium">{{ row.bill ? formatCurrency(row.bill.outstanding_amount) : '-' }}</td>
             <td>
               <span
                 v-if="row.bill"
@@ -184,9 +175,8 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
                   'bg-amber-100 text-amber-700': row.bill.finalized && row.bill.payment_status === 'partially_paid',
                   'bg-red-100 text-red-700': row.bill.finalized && row.bill.payment_status === 'unpaid',
                 }"
-                :title="row.bill.settled_via_later_bill ? `Settled automatically via a later month's payment` : ''"
               >
-                {{ row.bill.finalized ? row.bill.payment_status.replace('_', ' ') : 'draft' }}{{ row.bill.settled_via_later_bill ? ' *' : '' }}
+                {{ row.bill.finalized ? row.bill.payment_status.replace('_', ' ') : 'draft' }}
               </span>
               <span v-else class="badge bg-slate-100 text-slate-400">no bill</span>
             </td>
@@ -205,7 +195,7 @@ async function handleGenerate(row: (typeof rows.value)[number]) {
             </td>
           </tr>
           <tr v-if="rows.length === 0">
-            <td colspan="10" class="text-center text-slate-400 py-6">No occupied rooms with active tenants.</td>
+            <td colspan="12" class="text-center text-slate-400 py-6">No occupied rooms with active tenants.</td>
           </tr>
         </tbody>
       </table>

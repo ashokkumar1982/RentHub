@@ -2,6 +2,7 @@
 import { ref, onMounted, watch, computed } from 'vue'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatDate, formatMonth, currentBillingMonth, recentBillingMonths } from '../lib/format'
+import { latestBillPerTenant } from '../lib/billing'
 import type { Bill, Payment, Property } from '../types/models'
 
 type Tab = 'monthly-bills' | 'outstanding' | 'payments'
@@ -38,8 +39,9 @@ async function loadOutstanding() {
     .from('bills')
     .select('*, tenant:tenants(*), room:rooms(*)')
     .gt('outstanding_amount', 0)
+    .eq('finalized', true)
     .order('outstanding_amount', { ascending: false })
-  outstandingBills.value = data ?? []
+  outstandingBills.value = latestBillPerTenant(data ?? [])
 }
 
 async function loadPayments() {

@@ -5,7 +5,7 @@ import { Capacitor } from '@capacitor/core'
 import { supabase } from '../lib/supabase'
 import { formatCurrency, formatDate, formatMonth } from '../lib/format'
 import { computeBillTotal, computeOutstanding, computePaymentStatus } from '../lib/billing'
-import { recordPayment } from '../lib/payments'
+import { recordPayment, deletePayment, reconcileTenantBills, previewPreviousDue } from '../lib/payments'
 import { buildBillMessage, buildWhatsAppUrl } from '../lib/whatsapp'
 import { downloadBillPdf, printBillPdf, getBillPdfBlob } from '../lib/pdf'
 import type { Bill, Room, Tenant, Property, Payment, PaymentMethod } from '../types/models'
@@ -24,6 +24,11 @@ const loading = ref(true)
 const error = ref('')
 const saving = ref(false)
 
+// Live preview only — the authoritative previous_due is written by
+// reconcileTenantBills once the bill is finalized. Kept up to date so a draft
+// being edited reflects the tenant's current ledger, not a stale snapshot.
+const livePreviousDue = ref(0)
+
 const editForm = reactive({
   rent: 0,
   electricity_amount: 0,
@@ -33,6 +38,7 @@ const editForm = reactive({
   discount: 0,
 })
 
+// Bill Amount = this month's own charges only (never includes previous_due).
 const previewTotal = computed(() =>
   computeBillTotal({
     rent: editForm.rent,
@@ -40,10 +46,10 @@ const previewTotal = computed(() =>
     water_charge: editForm.water_charge,
     maintenance_charge: editForm.maintenance_charge,
     other_charge: editForm.other_charge,
-    previous_due: bill.value?.previous_due ?? 0,
     discount: editForm.discount,
   })
 )
+const previewOutstanding = computed(() => Math.round((previewTotal.value + livePreviousDue.value) * 100) / 100)
 
 async function load() {
   loading.value = true
@@ -77,6 +83,11 @@ async function load() {
     const { data: propData } = await supabase.from('properties').select('*').eq('id', room.value.property_id).single()
     property.value = propData ?? null
   }
+
+  if (!data.finalized) {
+    livePreviousDue.value = await previewPreviousDue(data.tenant_id, data.billing_month)
+  }
+
   loading.value = false
 }
 
@@ -86,6 +97,7 @@ async function handleSaveDraft() {
   if (!bill.value) return
   saving.value = true
   const total = previewTotal.value
+  const outstanding = computeOutstanding(total + livePreviousDue.value, 0)
   const payload = {
     rent: editForm.rent,
     electricity_amount: editForm.electricity_amount,
@@ -94,8 +106,9 @@ async function handleSaveDraft() {
     other_charge: editForm.other_charge,
     discount: editForm.discount,
     total_amount: total,
-    outstanding_amount: computeOutstanding(total, bill.value.paid_amount),
-    payment_status: computePaymentStatus(total, bill.value.paid_amount),
+    previous_due: livePreviousDue.value,
+    outstanding_amount: outstanding,
+    payment_status: computePaymentStatus(total + livePreviousDue.value, 0),
   }
   const { error: err } = await supabase.from('bills').update(payload).eq('id', bill.value.id)
   saving.value = false
@@ -106,15 +119,33 @@ async function handleSaveDraft() {
   await load()
 }
 
+// ---- Finalize (in-app confirmation, not window.confirm — unreliable in the Android WebView) ----
+const showFinalizeConfirm = ref(false)
+
 async function handleFinalize() {
   if (!bill.value) return
-  if (!confirm('Finalize this bill? Once finalized, the amounts are locked and will not change even if room or tenant rates change later.')) return
+  saving.value = true
   await handleSaveDraft()
+  if (!bill.value) {
+    saving.value = false
+    return
+  }
   const { error: err } = await supabase.from('bills').update({ finalized: true }).eq('id', bill.value.id)
   if (err) {
     error.value = err.message
+    saving.value = false
     return
   }
+  // Now that this bill is part of the ledger, recompute it (and every other
+  // finalized bill for this tenant) from the real payment history — this is
+  // what actually locks in the correct previous_due/outstanding/status.
+  const reconcileErr = await reconcileTenantBills(bill.value.tenant_id)
+  saving.value = false
+  if (reconcileErr) {
+    error.value = reconcileErr
+    return
+  }
+  showFinalizeConfirm.value = false
   await load()
 }
 
@@ -165,7 +196,7 @@ function blobToBase64(blob: Blob): Promise<string> {
   })
 }
 
-// -------- Record payment --------
+// -------- Record payment (always applied oldest-unpaid-month-first) --------
 const showPaymentModal = ref(false)
 const paymentForm = reactive({
   amount: 0,
@@ -191,13 +222,32 @@ async function submitPayment() {
   if (!bill.value) return
   paymentError.value = ''
   payingNow.value = true
-  const { error: err } = await recordPayment(bill.value, { ...paymentForm })
+  const { error: err } = await recordPayment(bill.value.tenant_id, bill.value.room_id, { ...paymentForm })
   payingNow.value = false
   if (err) {
     paymentError.value = err
     return
   }
   showPaymentModal.value = false
+  await load()
+}
+
+// -------- Delete a payment (with recalculation) --------
+const deletingPayment = ref<Payment | null>(null)
+const deletePaymentBusy = ref(false)
+const deletePaymentError = ref('')
+
+async function confirmDeletePayment() {
+  if (!deletingPayment.value || !bill.value) return
+  deletePaymentBusy.value = true
+  deletePaymentError.value = ''
+  const { error: err } = await deletePayment(deletingPayment.value.id, bill.value.tenant_id)
+  deletePaymentBusy.value = false
+  if (err) {
+    deletePaymentError.value = err
+    return
+  }
+  deletingPayment.value = null
   await load()
 }
 </script>
@@ -260,16 +310,20 @@ async function submitPayment() {
           </div>
         </div>
         <div class="flex justify-between text-sm text-slate-500">
-          <span>Previous Due (locked)</span>
-          <span>{{ formatCurrency(bill.previous_due) }}</span>
+          <span>Bill Amount (this month only)</span>
+          <span class="font-medium text-slate-700">{{ formatCurrency(previewTotal) }}</span>
+        </div>
+        <div class="flex justify-between text-sm text-slate-500">
+          <span>Previous Outstanding <span class="text-xs">(live, unpaid balance only)</span></span>
+          <span>{{ formatCurrency(livePreviousDue) }}</span>
         </div>
         <div class="flex justify-between items-center bg-slate-50 rounded-md px-3 py-2">
-          <span class="text-sm text-slate-600">Total</span>
-          <span class="font-semibold text-lg text-slate-800">{{ formatCurrency(previewTotal) }}</span>
+          <span class="text-sm text-slate-600">Total Amount Due</span>
+          <span class="font-semibold text-lg text-slate-800">{{ formatCurrency(previewOutstanding) }}</span>
         </div>
         <div class="flex gap-2 justify-end">
           <button class="btn-secondary" :disabled="saving" @click="handleSaveDraft">Save Draft</button>
-          <button class="btn-primary" :disabled="saving" @click="handleFinalize">Finalize</button>
+          <button class="btn-primary" :disabled="saving" @click="showFinalizeConfirm = true">Finalize</button>
         </div>
       </div>
 
@@ -280,14 +334,14 @@ async function submitPayment() {
         <div class="flex justify-between"><span class="text-slate-500">Water</span><span>{{ formatCurrency(bill.water_charge) }}</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Maintenance</span><span>{{ formatCurrency(bill.maintenance_charge) }}</span></div>
         <div v-if="bill.other_charge" class="flex justify-between"><span class="text-slate-500">Other Charges</span><span>{{ formatCurrency(bill.other_charge) }}</span></div>
-        <div v-if="bill.previous_due" class="flex justify-between"><span class="text-slate-500">Previous Due</span><span>{{ formatCurrency(bill.previous_due) }}</span></div>
         <div v-if="bill.discount" class="flex justify-between"><span class="text-slate-500">Discount</span><span>-{{ formatCurrency(bill.discount) }}</span></div>
         <hr class="border-slate-200" />
-        <div class="flex justify-between font-semibold text-base"><span>Total</span><span>{{ formatCurrency(bill.total_amount) }}</span></div>
+        <div class="flex justify-between font-semibold text-base"><span>Bill Amount (this month)</span><span>{{ formatCurrency(bill.total_amount) }}</span></div>
+        <div v-if="bill.previous_due > 0" class="flex justify-between"><span class="text-slate-500">Previous Outstanding</span><span>{{ formatCurrency(bill.previous_due) }}</span></div>
         <div class="flex justify-between"><span class="text-slate-500">Paid</span><span>{{ formatCurrency(bill.paid_amount) }}</span></div>
-        <div class="flex justify-between"><span class="text-slate-500">Outstanding</span><span>{{ formatCurrency(bill.outstanding_amount) }}</span></div>
-        <p v-if="bill.settled_via_later_bill" class="text-xs text-slate-400 pt-1">
-          Settled automatically — this balance was carried forward and paid off as part of a later month's bill.
+        <div class="flex justify-between font-semibold"><span>Outstanding</span><span>{{ formatCurrency(bill.outstanding_amount) }}</span></div>
+        <p v-if="bill.paid_amount > 0 && payments.length === 0" class="text-xs text-slate-400 pt-1">
+          This balance was covered by payment(s) recorded against a later bill for this tenant.
         </p>
       </div>
 
@@ -303,27 +357,47 @@ async function submitPayment() {
         </button>
       </div>
 
-      <!-- Payment history -->
+      <!-- Payment history (payments recorded directly against this bill) -->
       <div v-if="payments.length > 0" class="card overflow-x-auto">
         <h2 class="text-sm font-semibold text-slate-700 mb-2">Payments</h2>
         <table class="table-base">
-          <thead><tr><th>Date</th><th>Amount</th><th>Method</th><th>Reference</th></tr></thead>
+          <thead><tr><th>Date</th><th>Amount</th><th>Method</th><th>Reference</th><th></th></tr></thead>
           <tbody>
             <tr v-for="p in payments" :key="p.id">
               <td>{{ formatDate(p.payment_date) }}</td>
               <td>{{ formatCurrency(p.amount) }}</td>
               <td class="capitalize">{{ p.payment_method.replace('_', ' ') }}</td>
               <td>{{ p.reference_number || '-' }}</td>
+              <td class="text-right">
+                <button class="text-red-600 hover:underline text-xs" @click="deletingPayment = p">Delete</button>
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
 
+      <Modal v-if="showFinalizeConfirm" title="Finalize Bill" @close="showFinalizeConfirm = false">
+        <p class="text-sm text-slate-700">
+          Finalize this bill? Once finalized, the rent/electricity/water/maintenance amounts are locked and won't
+          change even if room or tenant rates change later.
+        </p>
+        <div class="flex justify-end gap-2 pt-4">
+          <button type="button" class="btn-secondary" :disabled="saving" @click="showFinalizeConfirm = false">Cancel</button>
+          <button type="button" class="btn-primary" :disabled="saving" @click="handleFinalize">
+            {{ saving ? 'Finalizing…' : 'Finalize' }}
+          </button>
+        </div>
+      </Modal>
+
       <Modal v-if="showPaymentModal" title="Record Payment" @close="showPaymentModal = false">
         <form class="space-y-3" @submit.prevent="submitPayment">
           <div class="flex justify-between text-sm text-slate-500">
-            <span>Outstanding</span><span class="font-medium">{{ formatCurrency(bill.outstanding_amount) }}</span>
+            <span>Total Outstanding</span><span class="font-medium">{{ formatCurrency(bill.outstanding_amount) }}</span>
           </div>
+          <p class="text-xs text-slate-400">
+            Applied to the oldest unpaid month first. A partial amount will close whichever months it fully covers and
+            leave the remainder on the next one.
+          </p>
           <div>
             <label class="label">Amount (₹)</label>
             <input v-model.number="paymentForm.amount" type="number" min="0.01" step="0.01" class="input" />
@@ -355,6 +429,20 @@ async function submitPayment() {
             <button type="submit" class="btn-primary" :disabled="payingNow">{{ payingNow ? 'Saving…' : 'Save Payment' }}</button>
           </div>
         </form>
+      </Modal>
+
+      <Modal v-if="deletingPayment" title="Delete Payment" @close="deletingPayment = null">
+        <p class="text-sm text-slate-700">
+          Delete this {{ formatCurrency(deletingPayment.amount) }} payment from {{ formatDate(deletingPayment.payment_date) }}?
+          Every month's balance for this tenant will be recalculated afterward.
+        </p>
+        <p v-if="deletePaymentError" class="text-sm text-red-600 mt-2">{{ deletePaymentError }}</p>
+        <div class="flex justify-end gap-2 pt-4">
+          <button type="button" class="btn-secondary" :disabled="deletePaymentBusy" @click="deletingPayment = null">Cancel</button>
+          <button type="button" class="btn-danger" :disabled="deletePaymentBusy" @click="confirmDeletePayment">
+            {{ deletePaymentBusy ? 'Deleting…' : 'Delete Payment' }}
+          </button>
+        </div>
       </Modal>
     </template>
   </div>

@@ -13,6 +13,10 @@ const editing = ref<Property | null>(null)
 const saving = ref(false)
 const formError = ref('')
 
+const deleting = ref<Property | null>(null)
+const deleteError = ref('')
+const deleteBusy = ref(false)
+
 const emptyForm = () => ({
   name: '',
   owner_name: '',
@@ -90,16 +94,26 @@ async function handleSave() {
   await loadProperties()
 }
 
-async function handleDelete(property: Property) {
+async function openDelete(property: Property) {
+  deleteError.value = ''
   const { count } = await supabase.from('rooms').select('id', { count: 'exact', head: true }).eq('property_id', property.id)
   if (count && count > 0) {
-    alert('This property has rooms and cannot be deleted. Remove or reassign its rooms first.')
+    deleteError.value = 'This property has rooms and cannot be deleted. Remove or reassign its rooms first.'
+  }
+  deleting.value = property
+}
+
+async function handleDelete() {
+  if (!deleting.value) return
+  deleteBusy.value = true
+  const { error: err } = await supabase.from('properties').delete().eq('id', deleting.value.id)
+  deleteBusy.value = false
+  if (err) {
+    deleteError.value = err.message
     return
   }
-  if (!confirm(`Delete property "${property.name}"?`)) return
-  const { error: err } = await supabase.from('properties').delete().eq('id', property.id)
-  if (err) alert(err.message)
-  else await loadProperties()
+  deleting.value = null
+  await loadProperties()
 }
 
 onMounted(loadProperties)
@@ -124,7 +138,7 @@ onMounted(loadProperties)
           <h2 class="font-semibold text-slate-800">{{ p.name }}</h2>
           <div class="space-x-2">
             <button class="text-brand-600 hover:underline text-xs" @click="openEdit(p)">Edit</button>
-            <button class="text-red-600 hover:underline text-xs" @click="handleDelete(p)">Delete</button>
+            <button class="text-red-600 hover:underline text-xs" @click="openDelete(p)">Delete</button>
           </div>
         </div>
         <p class="text-sm text-slate-500">Owner: {{ p.owner_name || '-' }}</p>
@@ -190,6 +204,21 @@ onMounted(loadProperties)
           <button type="submit" class="btn-primary" :disabled="saving">{{ saving ? 'Saving…' : 'Save' }}</button>
         </div>
       </form>
+    </Modal>
+
+    <Modal v-if="deleting" title="Delete Property" @close="deleting = null">
+      <p v-if="!deleteError" class="text-sm text-slate-700">
+        Are you sure you want to permanently delete "{{ deleting.name }}"? This cannot be undone.
+      </p>
+      <p v-if="deleteError" class="text-sm text-red-600">{{ deleteError }}</p>
+      <div class="flex justify-end gap-2 pt-4">
+        <button type="button" class="btn-secondary" :disabled="deleteBusy" @click="deleting = null">
+          {{ deleteError ? 'Close' : 'Cancel' }}
+        </button>
+        <button v-if="!deleteError" type="button" class="btn-danger" :disabled="deleteBusy" @click="handleDelete">
+          {{ deleteBusy ? 'Deleting…' : 'Delete Permanently' }}
+        </button>
+      </div>
     </Modal>
   </div>
 </template>

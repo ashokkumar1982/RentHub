@@ -20,6 +20,9 @@ const filteredRooms = computed(() =>
 const showModal = ref(false)
 const editing = ref<Room | null>(null)
 const viewing = ref<Room | null>(null)
+const deleting = ref<Room | null>(null)
+const deleteError = ref('')
+const deleteBusy = ref(false)
 const saving = ref(false)
 const formError = ref('')
 
@@ -118,16 +121,26 @@ async function handleSave() {
   await loadData()
 }
 
-async function handleDelete(room: Room) {
+async function openDelete(room: Room) {
+  deleteError.value = ''
   const { count } = await supabase.from('bills').select('id', { count: 'exact', head: true }).eq('room_id', room.id)
   if (count && count > 0) {
-    alert('This room already has bills and cannot be deleted.')
+    deleteError.value = 'This room already has bills and cannot be deleted.'
+  }
+  deleting.value = room
+}
+
+async function handleDelete() {
+  if (!deleting.value) return
+  deleteBusy.value = true
+  const { error: err } = await supabase.from('rooms').delete().eq('id', deleting.value.id)
+  deleteBusy.value = false
+  if (err) {
+    deleteError.value = err.message
     return
   }
-  if (!confirm(`Delete room ${room.room_number}?`)) return
-  const { error: err } = await supabase.from('rooms').delete().eq('id', room.id)
-  if (err) alert(err.message)
-  else await loadData()
+  deleting.value = null
+  await loadData()
 }
 
 onMounted(loadData)
@@ -185,7 +198,7 @@ onMounted(loadData)
             <td class="text-right space-x-2 whitespace-nowrap">
               <button class="text-brand-600 hover:underline text-xs" @click="viewing = room">View</button>
               <button class="text-brand-600 hover:underline text-xs" @click="openEdit(room)">Edit</button>
-              <button class="text-red-600 hover:underline text-xs" @click="handleDelete(room)">Delete</button>
+              <button class="text-red-600 hover:underline text-xs" @click="openDelete(room)">Delete</button>
             </td>
           </tr>
           <tr v-if="filteredRooms.length === 0">
@@ -257,6 +270,21 @@ onMounted(loadData)
         <div class="flex justify-between"><dt class="text-slate-500">Meter Number</dt><dd>{{ viewing.meter_number || '-' }}</dd></div>
         <div class="flex justify-between"><dt class="text-slate-500">Status</dt><dd>{{ viewing.status }}</dd></div>
       </dl>
+    </Modal>
+
+    <Modal v-if="deleting" title="Delete Room" @close="deleting = null">
+      <p v-if="!deleteError" class="text-sm text-slate-700">
+        Are you sure you want to permanently delete room {{ deleting.room_number }}? This cannot be undone.
+      </p>
+      <p v-if="deleteError" class="text-sm text-red-600">{{ deleteError }}</p>
+      <div class="flex justify-end gap-2 pt-4">
+        <button type="button" class="btn-secondary" :disabled="deleteBusy" @click="deleting = null">
+          {{ deleteError ? 'Close' : 'Cancel' }}
+        </button>
+        <button v-if="!deleteError" type="button" class="btn-danger" :disabled="deleteBusy" @click="handleDelete">
+          {{ deleteBusy ? 'Deleting…' : 'Delete Permanently' }}
+        </button>
+      </div>
     </Modal>
   </div>
 </template>

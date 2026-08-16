@@ -92,13 +92,15 @@ create table if not exists bills (
   other_charge numeric(10,2) not null default 0,
   previous_due numeric(10,2) not null default 0,
   discount numeric(10,2) not null default 0,
+  -- Current month's own charges ONLY (rent+electricity+water+maintenance+other-discount).
+  -- Must never have previous_due folded in — previous_due/paid_amount/outstanding_amount
+  -- are always derived from the tenant's full ledger, see reconcileTenantBills() in
+  -- src/lib/payments.ts (oldest-unpaid-month-first allocation).
   total_amount numeric(10,2) not null default 0,
   paid_amount numeric(10,2) not null default 0,
   outstanding_amount numeric(10,2) not null default 0,
   payment_status text not null default 'unpaid' check (payment_status in ('unpaid','partially_paid','paid')),
-  -- true when this bill was auto-marked paid because a later bill's cumulative
-  -- total (which already folded this bill's balance in via previous_due) was
-  -- paid off, rather than because a payment was recorded against it directly.
+  -- Unused by the current model (kept for backward compatibility with older data).
   settled_via_later_bill boolean not null default false,
   whatsapp_shared boolean not null default false,
   due_date date,

@@ -83,14 +83,19 @@ export function buildBillPdf(bill: Bill, tenant: Tenant, room: Room, property: P
 
   doc.setFontSize(13)
   doc.setFont('helvetica', 'bold')
-  doc.text('TOTAL AMOUNT', marginX, y)
+  doc.text('BILL AMOUNT (THIS MONTH)', marginX, y)
   doc.text(rs(bill.total_amount), 150, y)
   y += 8
 
   doc.setFontSize(10)
   doc.setFont('helvetica', 'normal')
   doc.text(`Paid: ${rs(bill.paid_amount)}`, marginX, y)
-  doc.text(`Outstanding: ${rs(bill.outstanding_amount)}`, 150, y)
+  y += 6
+
+  doc.setFontSize(13)
+  doc.setFont('helvetica', 'bold')
+  doc.text('TOTAL AMOUNT DUE', marginX, y)
+  doc.text(rs(bill.outstanding_amount), 150, y)
   y += 12
 
   if (property?.mobile) {
